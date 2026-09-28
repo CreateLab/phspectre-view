@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex">
+<meta name="color-scheme" content="dark">
+<title>PhSpectre</title>
+<style>
+  :root {
+    --bg: #111111;
+    --card: #1b1b1b;
+    --line: #2b2b2b;
+    --text: #ececec;
+    --muted: #8d8d8d;
+    --accent: #e8b04a;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); }
+  body {
+    font: 16px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    min-height: 100vh;
+    display: flex;
+    justify-content: center;
+    padding: 24px 16px 48px;
+  }
+  main { width: 100%; max-width: 520px; }
+  .photo { display: block; width: 100%; border-radius: 10px; margin-bottom: 16px; background: var(--card); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px; margin-bottom: 14px; }
+  h1 { font-size: 1.15rem; margin: 0 0 2px; font-weight: 600; }
+  .sub { color: var(--muted); font-size: .9rem; }
+  .exposure { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 16px; }
+  .exposure div { text-align: center; }
+  .exposure b { display: block; font-size: 1.15rem; font-variant-numeric: tabular-nums; }
+  .exposure span, .label { color: var(--muted); font-size: .72rem; text-transform: uppercase; letter-spacing: .06em; }
+  .date { margin-top: 14px; color: var(--muted); font-size: .85rem; }
+  .sim {
+    display: inline-block; padding: 4px 12px; border-radius: 999px;
+    background: var(--accent); color: #1a1200; font-weight: 700; font-size: .95rem;
+  }
+  .title { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 12px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 20px; }
+  .row { display: flex; justify-content: space-between; gap: 8px; padding: 9px 0; border-bottom: 1px solid var(--line); font-size: .95rem; }
+  .row:nth-last-child(-n+2) { border-bottom: 0; }
+  .row .k { color: var(--muted); }
+  .row .v { font-variant-numeric: tabular-nums; text-align: right; }
+  .note { margin-top: 12px; color: var(--muted); font-size: .9rem; white-space: pre-wrap; }
+  .empty p { color: var(--muted); margin: 8px 0 16px; }
+  button {
+    font: inherit; color: var(--text); background: transparent; border: 1px solid var(--line);
+    border-radius: 8px; padding: 8px 14px; cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  .err { color: #e07a7a; }
+  footer { text-align: center; color: var(--muted); font-size: .75rem; margin-top: 20px; }
+  footer a { color: inherit; }
+  @media (max-width: 380px) { .grid { grid-template-columns: 1fr; } .row:nth-last-child(2) { border-bottom: 1px solid var(--line); } }
+</style>
+</head>
+<body>
+<main id="app"></main>
+
+<script>
+/*
+ * PhSpectre viewer.
+ *
+ * URL format:   #<ver>.<base64url payload>
+ *   ver 1 → payload = raw deflate (C# DeflateStream) of a UTF-8 JSON array
+ *   ver 0 → payload = plain UTF-8 JSON array (debug)
+ *
+ * Main array (positional, null = unknown):
+ *   0 camera        string
+ *   1 lens          string
+ *   2 focal mm      number
+ *   3 aperture      number        (2.8)
+ *   4 shutter       number        seconds (0.004 = 1/250)
+ *   5 ISO           number
+ *   6 taken         number        yyyyMMddHHmm, camera-local, no timezone (202609231717)
+ *   7 recipe        array | null  (see below)
+ *   8 note          string | null free text
+ *   9 photo         string | null full https:// URL, or an id resolved via PHOTO_BASE
+ *
+ * Recipe array (all ints):
+ *   0 film sim      code → SIMS
+ *   1 white balance code → WB
+ *   2 kelvin        number (0 = none, used when WB is Kelvin)
+ *   3 WB shift R    -9..+9
+ *   4 WB shift B    -9..+9
+ *   5 dynamic range code → DR
+ *   6 highlight     half-steps  (3 = +1.5)
+ *   7 shadow        half-steps
+ *   8 color         -4..+4
+ *   9 sharpness     -4..+4
+ *  10 noise red.    -4..+4
+ *  11 clarity       -5..+5
+ *  12 grain         code → GRAIN
+ *  13 color chrome  code → CHROME
+ *  14 CC blue       code → CHROME
+ *
+ * Keep the code tables below in sync with the app's enums.
+ */
+const PHOTO_BASE = ""; // e.g. "https://photos.example.com/p/" — used when field 9 is an id, ".jpg" is appended
+
+const SIMS = ["Provia / Standard","Velvia / Vivid","Astia / Soft","Classic Chrome","Pro Neg. Hi","Pro Neg. Std","Classic Neg.",
+  "Eterna / Cinema","Eterna Bleach Bypass","Nostalgic Neg.","Reala Ace","Acros","Acros + Ye","Acros + R","Acros + G",
+  "Monochrome","Monochrome + Ye","Monochrome + R","Monochrome + G","Sepia"];
+const WB = ["Auto","Auto (white priority)","Auto (ambient priority)","Daylight","Shade","Fluorescent 1","Fluorescent 2",
+  "Fluorescent 3","Incandescent","Underwater","Kelvin","Custom"];
+const DR = ["Auto","DR100","DR200","DR400"];
+const GRAIN = ["Off","Weak · Small","Strong · Small","Weak · Large","Strong · Large"];
+const CHROME = ["Off","Weak","Strong"];
+
+const app = document.getElementById("app");
+
+/* ---------- helpers ---------- */
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;
+  return e;
+}
+const has = v => v !== null && v !== undefined && v !== "";
+const signed = n => n > 0 ? "+" + n : n < 0 ? "−" + Math.abs(n) : "0";
+const half = n => signed(n / 2);
+const pick = (arr, i) => arr[i] ?? "—";
+
+function fmtShutter(s) {
+  if (!has(s)) return "—";
+  if (s >= 1) return (Math.round(s * 10) / 10) + "s";
+  return "1/" + Math.round(1 / s);
+}
+function fmtDate(n) {
+  if (!has(n)) return "";
+  const s = String(n).padStart(12, "0");
+  return `${s.slice(0,4)}-${s.slice(4,6)}-${s.slice(6,8)} ${s.slice(8,10)}:${s.slice(10,12)}`;
+}
+
+/* ---------- codec ---------- */
+function fromB64url(s) {
+  s = s.replace(/-/g, "+").replace(/_/g, "/");
+  while (s.length % 4) s += "=";
+  return Uint8Array.from(atob(s), c => c.charCodeAt(0));
+}
+function toB64url(u8) {
+  let bin = ""; u8.forEach(b => bin += String.fromCharCode(b));
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+async function pipe(u8, stream) {
+  const out = new Blob([u8]).stream().pipeThrough(stream);
+  return new Uint8Array(await new Response(out).arrayBuffer());
+}
+async function decode(hash) {
+  const m = /^#?(\d)\.([A-Za-z0-9_-]+)$/.exec(hash);
+  if (!m) return null;
+  let bytes = fromB64url(m[2]);
+  if (m[1] === "1") bytes = await pipe(bytes, new DecompressionStream("deflate-raw"));
+  else if (m[1] !== "0") throw new Error("Unknown format version " + m[1]);
+  const data = JSON.parse(new TextDecoder().decode(bytes));
+  if (!Array.isArray(data)) throw new Error("Bad payload");
+  return data;
+}
+async function encode(arr) {
+  const raw = new TextEncoder().encode(JSON.stringify(arr));
+  return "#1." + toB64url(await pipe(raw, new CompressionStream("deflate-raw")));
+}
+
+/* ---------- render ---------- */
+function photoUrl(v) {
+  if (!has(v)) return null;
+  v = String(v);
+  if (/^https:\/\//i.test(v)) return v;
+  if (PHOTO_BASE && /^[A-Za-z0-9_-]+$/.test(v)) return PHOTO_BASE + v + ".jpg";
+  return null;
+}
+
+function renderRecipe(r) {
+  const [sim, wb, kelvin, wbR, wbB, dr, hi, sh, color, sharp, nr, clarity, grain, cc, ccb] = r;
+  const card = el("section", "card");
+  const title = el("div", "title");
+  title.append(el("span", "sim", pick(SIMS, sim)), el("span", "label", "Film recipe"));
+  card.append(title);
+
+  const grid = el("div", "grid");
+  const wbText = wb === 10 && kelvin ? kelvin + "K" : pick(WB, wb);
+  const rows = [
+    ["White balance", wbText],
+    ["WB shift", `R ${signed(wbR ?? 0)} · B ${signed(wbB ?? 0)}`],
+    ["Dynamic range", pick(DR, dr)],
+    ["Grain", pick(GRAIN, grain)],
+    ["Highlight", half(hi ?? 0)],
+    ["Shadow", half(sh ?? 0)],
+    ["Color", signed(color ?? 0)],
+    ["Clarity", signed(clarity ?? 0)],
+    ["Sharpness", signed(sharp ?? 0)],
+    ["Noise reduction", signed(nr ?? 0)],
+    ["Color Chrome", pick(CHROME, cc)],
+    ["CC Blue", pick(CHROME, ccb)],
+  ];
+  for (const [k, v] of rows) {
+    const row = el("div", "row");
+    row.append(el("span", "k", k), el("span", "v", v));
+    grid.append(row);
+  }
+  card.append(grid);
+  return card;
+}
+
+function render(d) {
+  app.replaceChildren();
+  const [camera, lens, focal, aperture, shutter, iso, taken, recipe, note, photo] = d;
+
+  const src = photoUrl(photo);
+  if (src) {
+    const img = el("img", "photo");
+    img.src = src; img.alt = "Photo"; img.loading = "lazy"; img.referrerPolicy = "no-referrer";
+    img.onerror = () => img.remove();
+    app.append(img);
+  }
+
+  const head = el("section", "card");
+  head.append(el("h1", null, has(camera) ? camera : "Unknown camera"));
+  if (has(lens)) head.append(el("div", "sub", lens));
+
+  const exp = el("div", "exposure");
+  const cell = (v, l) => { const c = el("div"); c.append(el("b", null, v), el("span", null, l)); return c; };
+  exp.append(
+    cell(has(focal) ? focal + " mm" : "—", "Focal"),
+    cell(has(aperture) ? "f/" + aperture : "—", "Aperture"),
+    cell(fmtShutter(shutter), "Shutter"),
+    cell(has(iso) ? String(iso) : "—", "ISO"),
+  );
+  head.append(exp);
+  if (has(taken)) head.append(el("div", "date", fmtDate(taken)));
+  if (has(note)) head.append(el("div", "note", note));
+  app.append(head);
+
+  if (Array.isArray(recipe)) app.append(renderRecipe(recipe));
+
+  const f = el("footer");
+  const a = el("a", null, "PhSpectre");
+  a.href = "https://github.com/CreateLab/PhSpectre";
+  f.append("Made with ", a);
+  app.append(f);
+}
+
+function renderEmpty(error) {
+  app.replaceChildren();
+  const c = el("section", "card empty");
+  c.append(el("h1", null, "PhSpectre"));
+  if (error) c.append(el("p", "err", "Couldn't read this link: " + error));
+  else c.append(el("p", null, "Scan the QR code on a PhSpectre frame to see the shot's details and film recipe here."));
+  const b = el("button", null, "Show demo");
+  b.onclick = async () => { location.hash = await encode(DEMO); };
+  c.append(b);
+  app.append(c);
+}
+
+const DEMO = [
+  "FUJIFILM X-T5", "XF 35mm F1.4 R", 35, 2.8, 1 / 250, 400, 202609231717,
+  [3, 3, 0, 2, -5, 2, 3, 3, -2, -1, -4, -2, 1, 2, 1],
+  "Demo shot", null,
+];
+
+async function boot() {
+  try {
+    const d = await decode(location.hash);
+    if (d) render(d); else renderEmpty();
+  } catch (e) {
+    renderEmpty(e.message);
+  }
+}
+addEventListener("hashchange", boot);
+boot();
+</script>
+</body>
+</html>

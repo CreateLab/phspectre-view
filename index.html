@@ -33,7 +33,6 @@
   .exposure div { text-align: center; }
   .exposure b { display: block; font-size: 1.15rem; font-variant-numeric: tabular-nums; }
   .exposure span, .label { color: var(--muted); font-size: .72rem; text-transform: uppercase; letter-spacing: .06em; }
-  .date { margin-top: 14px; color: var(--muted); font-size: .85rem; }
   .sim {
     display: inline-block; padding: 4px 12px; border-radius: 999px;
     background: var(--accent); color: #1a1200; font-weight: 700; font-size: .95rem;
@@ -62,44 +61,58 @@
 
 <script>
 /*
- * PhSpectre viewer.
+ * PhSpectre viewer — bit-packed binary payload format.
  *
- * URL format:   #<ver>.<base64url payload>
- *   ver 1 → payload = raw deflate (C# DeflateStream) of a UTF-8 JSON array
- *   ver 0 → payload = plain UTF-8 JSON array (debug)
+ * URL: #b.<base64url>
+ *   'b' = this format (only one for now; bump the letter if it ever changes
+ *   incompatibly — old links then just show "couldn't read this link").
  *
- * Main array (positional, null = unknown):
- *   0 camera        string
- *   1 lens          string
- *   2 focal mm      number
- *   3 aperture      number        (2.8)
- *   4 shutter       number        seconds (0.004 = 1/250)
- *   5 ISO           number
- *   6 taken         number        yyyyMMddHHmm, camera-local, no timezone (202609231717)
- *   7 recipe        array | null  (see below)
- *   8 note          string | null free text
- *   9 photo         string | null full https:// URL, or an id resolved via PHOTO_BASE
+ * Byte layout (all multi-bit fields inside the two packed blocks are
+ * MSB-first: the first field listed occupies the highest bits). Everything
+ * outside those two blocks is plain byte-aligned.
  *
- * Recipe array (all ints):
- *   0 film sim      code → SIMS
- *   1 white balance code → WB
- *   2 kelvin        number (0 = none, used when WB is Kelvin)
- *   3 WB shift R    -9..+9
- *   4 WB shift B    -9..+9
- *   5 dynamic range code → DR
- *   6 highlight     half-steps  (3 = +1.5)
- *   7 shadow        half-steps
- *   8 color         -4..+4
- *   9 sharpness     -4..+4
- *  10 noise red.    -4..+4
- *  11 clarity       -5..+5
- *  12 grain         code → GRAIN
- *  13 color chrome  code → CHROME
- *  14 CC blue       code → CHROME
+ *   byte 0        flags
+ *                   bit0 hasRecipe
+ *                   bit1 hasPhoto
+ *                   bit2 hasNote
+ *                   bit3-7 reserved, must be 0
+ *   1 byte + N     camera: length-prefixed UTF-8 (length 0 = unknown).
+ *                   Strip any "FUJIFILM " brand prefix before encoding —
+ *                   implied whenever a recipe block is present.
+ *   1 byte + N     lens: length-prefixed UTF-8 (length 0 = unknown)
+ *   5 bytes        EXPOSURE block, 34 packed bits + 6 zero padding bits:
+ *                     focal_mm        10 bit, unsigned, raw value, 0 = unknown
+ *                     aperture_x10     8 bit, unsigned, f-number*10, 0 = unknown
+ *                     shutter_code     8 bit, unsigned, 255 = unknown, else
+ *                                      tv3 = code - 64, seconds = 2^(-tv3/3)
+ *                     iso_code         8 bit, unsigned, 255 = unknown, else
+ *                                      stops3 = code - 64, ISO = 100 * 2^(stops3/3)
+ *   8 bytes        RECIPE block (only if hasRecipe), 62 packed bits + 2 zero
+ *                  padding bits. All "value = raw - offset" fields are given
+ *                  as raw ranges below:
+ *                     film_sim         5 bit  0..19        → SIMS
+ *                     white_balance    4 bit  0..11        → WB
+ *                     kelvin_enc      10 bit  0 = unset, else K = (raw-1)*10+2500
+ *                     wb_shift_r       5 bit  raw-9  (raw 0..18 → -9..9)
+ *                     wb_shift_b       5 bit  raw-9
+ *                     dynamic_range    2 bit  0..3         → DR
+ *                     highlight        4 bit  raw-8  (half-stops)
+ *                     shadow           4 bit  raw-8  (half-stops)
+ *                     color            4 bit  raw-8
+ *                     sharpness        4 bit  raw-8
+ *                     noise_reduction  4 bit  raw-8
+ *                     clarity          4 bit  raw-8
+ *                     grain            3 bit  0..4         → GRAIN
+ *                     color_chrome     2 bit  0..2         → CHROME
+ *                     cc_blue          2 bit  0..2         → CHROME
+ *   1 byte + N     photo (only if hasPhoto): length-prefixed UTF-8 — full
+ *                  https:// URL, or an id resolved via PHOTO_BASE below
+ *   1 byte + N     note (only if hasNote): length-prefixed UTF-8, free text
  *
- * Keep the code tables below in sync with the app's enums.
+ * No date field — intentionally dropped.
+ * No JSON, no compression: the packing already does that job.
  */
-const PHOTO_BASE = ""; // e.g. "https://photos.example.com/p/" — used when field 9 is an id, ".jpg" is appended
+const PHOTO_BASE = ""; // e.g. "https://photos.example.com/p/" — used when the photo field is a bare id, ".jpg" is appended
 
 const SIMS = ["Provia / Standard","Velvia / Vivid","Astia / Soft","Classic Chrome","Pro Neg. Hi","Pro Neg. Std","Classic Neg.",
   "Eterna / Cinema","Eterna Bleach Bypass","Nostalgic Neg.","Reala Ace","Acros","Acros + Ye","Acros + R","Acros + G",
@@ -112,7 +125,7 @@ const CHROME = ["Off","Weak","Strong"];
 
 const app = document.getElementById("app");
 
-/* ---------- helpers ---------- */
+/* ---------- small helpers ---------- */
 function el(tag, cls, text) {
   const e = document.createElement(tag);
   if (cls) e.className = cls;
@@ -129,72 +142,200 @@ function fmtShutter(s) {
   if (s >= 1) return (Math.round(s * 10) / 10) + "s";
   return "1/" + Math.round(1 / s);
 }
-function fmtDate(n) {
-  if (!has(n)) return "";
-  const s = String(n).padStart(12, "0");
-  return `${s.slice(0,4)}-${s.slice(4,6)}-${s.slice(6,8)} ${s.slice(8,10)}:${s.slice(10,12)}`;
-}
 
-/* ---------- codec ---------- */
+/* ---------- base64url ---------- */
 function fromB64url(s) {
   s = s.replace(/-/g, "+").replace(/_/g, "/");
   while (s.length % 4) s += "=";
-  return Uint8Array.from(atob(s), c => c.charCodeAt(0));
+  const bin = atob(s);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
 }
-function toB64url(u8) {
-  let bin = ""; u8.forEach(b => bin += String.fromCharCode(b));
+function toB64url(bytes) {
+  let bin = ""; bytes.forEach(b => bin += String.fromCharCode(b));
   return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
-async function pipe(u8, stream) {
-  const out = new Blob([u8]).stream().pipeThrough(stream);
-  return new Uint8Array(await new Response(out).arrayBuffer());
+
+/* ---------- bit-level read/write over a fixed-size byte slice ---------- */
+function bytesToBigInt(bytes) {
+  let v = 0n;
+  for (const b of bytes) v = (v << 8n) | BigInt(b);
+  return v;
 }
-async function decode(hash) {
-  const m = /^#?(\d)\.([A-Za-z0-9_-]+)$/.exec(hash);
+function bitReader(bytes) {
+  const value = bytesToBigInt(bytes);
+  let remaining = BigInt(bytes.length * 8);
+  return {
+    read(width) {
+      const w = BigInt(width);
+      remaining -= w;
+      return Number((value >> remaining) & ((1n << w) - 1n));
+    },
+  };
+}
+function bitWriter(totalBits) {
+  let acc = 0n, used = 0n;
+  return {
+    write(value, width) {
+      const w = BigInt(width);
+      acc = (acc << w) | (BigInt(value) & ((1n << w) - 1n));
+      used += w;
+    },
+    toBytes(byteLen) {
+      let v = acc << (BigInt(totalBits) - used); // right-pad with zero bits
+      const out = new Uint8Array(byteLen);
+      for (let i = byteLen - 1; i >= 0; i--) { out[i] = Number(v & 0xFFn); v >>= 8n; }
+      return out;
+    },
+  };
+}
+
+/* ---------- string (length-prefixed) read/write ---------- */
+function readStr(bytes, pos) {
+  const len = bytes[pos.i++];
+  if (!len) return null;
+  const s = new TextDecoder().decode(bytes.subarray(pos.i, pos.i + len));
+  pos.i += len;
+  return s;
+}
+function writeStr(parts, s) {
+  const bytes = s ? new TextEncoder().encode(s) : new Uint8Array(0);
+  if (bytes.length > 255) throw new Error("string too long (max 255 bytes): " + s);
+  parts.push(new Uint8Array([bytes.length]), bytes);
+}
+
+/* ---------- payload codec ---------- */
+function decode(hash) {
+  const m = /^#?b\.([A-Za-z0-9_-]+)$/.exec(hash);
   if (!m) return null;
-  let bytes = fromB64url(m[2]);
-  if (m[1] === "1") bytes = await pipe(bytes, new DecompressionStream("deflate-raw"));
-  else if (m[1] !== "0") throw new Error("Unknown format version " + m[1]);
-  const data = JSON.parse(new TextDecoder().decode(bytes));
-  if (!Array.isArray(data)) throw new Error("Bad payload");
-  return data;
+  const bytes = fromB64url(m[1]);
+  const pos = { i: 0 };
+
+  const flags = bytes[pos.i++];
+  const hasRecipe = !!(flags & 1), hasPhoto = !!(flags & 2), hasNote = !!(flags & 4);
+
+  const camera = readStr(bytes, pos);
+  const lens = readStr(bytes, pos);
+
+  const er = bitReader(bytes.subarray(pos.i, pos.i + 5)); pos.i += 5;
+  const focalRaw = er.read(10);
+  const apertureRaw = er.read(8);
+  const shutterRaw = er.read(8);
+  const isoRaw = er.read(8);
+
+  let recipe = null;
+  if (hasRecipe) {
+    const rr = bitReader(bytes.subarray(pos.i, pos.i + 8)); pos.i += 8;
+    recipe = {
+      sim: rr.read(5),
+      wb: rr.read(4),
+      kelvinEnc: rr.read(10),
+      wbShiftR: rr.read(5) - 9,
+      wbShiftB: rr.read(5) - 9,
+      dr: rr.read(2),
+      highlight: rr.read(4) - 8,
+      shadow: rr.read(4) - 8,
+      color: rr.read(4) - 8,
+      sharpness: rr.read(4) - 8,
+      noiseReduction: rr.read(4) - 8,
+      clarity: rr.read(4) - 8,
+      grain: rr.read(3),
+      colorChrome: rr.read(2),
+      ccBlue: rr.read(2),
+    };
+  }
+
+  const photo = hasPhoto ? readStr(bytes, pos) : null;
+  const note = hasNote ? readStr(bytes, pos) : null;
+
+  return {
+    camera, lens,
+    focal: focalRaw || null,
+    aperture: apertureRaw ? apertureRaw / 10 : null,
+    shutter: shutterRaw === 255 ? null : Math.pow(2, -(shutterRaw - 64) / 3),
+    iso: isoRaw === 255 ? null : Math.round(100 * Math.pow(2, (isoRaw - 64) / 3)),
+    recipe, photo, note,
+  };
 }
-async function encode(arr) {
-  const raw = new TextEncoder().encode(JSON.stringify(arr));
-  return "#1." + toB64url(await pipe(raw, new CompressionStream("deflate-raw")));
+
+// Debug/demo encoder — mirrors the future C# writer, kept here only so this
+// page can produce a test link without it. `f` matches the shape `decode()`
+// returns, plus raw (unrounded) exposure numbers.
+function encode(f) {
+  const hasRecipe = !!f.recipe, hasPhoto = has(f.photo), hasNote = has(f.note);
+  const flags = (hasRecipe ? 1 : 0) | (hasPhoto ? 2 : 0) | (hasNote ? 4 : 0);
+
+  const parts = [new Uint8Array([flags])];
+  writeStr(parts, f.camera);
+  writeStr(parts, f.lens);
+
+  const ew = bitWriter(40);
+  ew.write(f.focal || 0, 10);
+  ew.write(f.aperture ? Math.round(f.aperture * 10) : 0, 8);
+  ew.write(has(f.shutter) ? clampByte(Math.round(Math.log2(1 / f.shutter) * 3) + 64) : 255, 8);
+  ew.write(has(f.iso) ? clampByte(Math.round(3 * Math.log2(f.iso / 100)) + 64) : 255, 8);
+  parts.push(ew.toBytes(5));
+
+  if (hasRecipe) {
+    const r = f.recipe;
+    const rw = bitWriter(64);
+    rw.write(r.sim ?? 0, 5);
+    rw.write(r.wb ?? 0, 4);
+    rw.write(r.kelvin ? Math.round((r.kelvin - 2500) / 10) + 1 : 0, 10);
+    rw.write((r.wbShiftR ?? 0) + 9, 5);
+    rw.write((r.wbShiftB ?? 0) + 9, 5);
+    rw.write(r.dr ?? 0, 2);
+    rw.write((r.highlight ?? 0) + 8, 4);
+    rw.write((r.shadow ?? 0) + 8, 4);
+    rw.write((r.color ?? 0) + 8, 4);
+    rw.write((r.sharpness ?? 0) + 8, 4);
+    rw.write((r.noiseReduction ?? 0) + 8, 4);
+    rw.write((r.clarity ?? 0) + 8, 4);
+    rw.write(r.grain ?? 0, 3);
+    rw.write(r.colorChrome ?? 0, 2);
+    rw.write(r.ccBlue ?? 0, 2);
+    parts.push(rw.toBytes(8));
+  }
+  if (hasPhoto) writeStr(parts, f.photo);
+  if (hasNote) writeStr(parts, f.note);
+
+  let total = 0; for (const p of parts) total += p.length;
+  const out = new Uint8Array(total);
+  let o = 0; for (const p of parts) { out.set(p, o); o += p.length; }
+  return "#b." + toB64url(out);
 }
+function clampByte(n) { return Math.max(0, Math.min(254, n)); }
 
 /* ---------- render ---------- */
 function photoUrl(v) {
   if (!has(v)) return null;
-  v = String(v);
   if (/^https:\/\//i.test(v)) return v;
   if (PHOTO_BASE && /^[A-Za-z0-9_-]+$/.test(v)) return PHOTO_BASE + v + ".jpg";
   return null;
 }
 
 function renderRecipe(r) {
-  const [sim, wb, kelvin, wbR, wbB, dr, hi, sh, color, sharp, nr, clarity, grain, cc, ccb] = r;
   const card = el("section", "card");
   const title = el("div", "title");
-  title.append(el("span", "sim", pick(SIMS, sim)), el("span", "label", "Film recipe"));
+  title.append(el("span", "sim", pick(SIMS, r.sim)), el("span", "label", "Film recipe"));
   card.append(title);
 
   const grid = el("div", "grid");
-  const wbText = wb === 10 && kelvin ? kelvin + "K" : pick(WB, wb);
+  const wbText = r.wb === 10 && r.kelvinEnc ? ((r.kelvinEnc - 1) * 10 + 2500) + "K" : pick(WB, r.wb);
   const rows = [
     ["White balance", wbText],
-    ["WB shift", `R ${signed(wbR ?? 0)} · B ${signed(wbB ?? 0)}`],
-    ["Dynamic range", pick(DR, dr)],
-    ["Grain", pick(GRAIN, grain)],
-    ["Highlight", half(hi ?? 0)],
-    ["Shadow", half(sh ?? 0)],
-    ["Color", signed(color ?? 0)],
-    ["Clarity", signed(clarity ?? 0)],
-    ["Sharpness", signed(sharp ?? 0)],
-    ["Noise reduction", signed(nr ?? 0)],
-    ["Color Chrome", pick(CHROME, cc)],
-    ["CC Blue", pick(CHROME, ccb)],
+    ["WB shift", `R ${signed(r.wbShiftR)} · B ${signed(r.wbShiftB)}`],
+    ["Dynamic range", pick(DR, r.dr)],
+    ["Grain", pick(GRAIN, r.grain)],
+    ["Highlight", half(r.highlight)],
+    ["Shadow", half(r.shadow)],
+    ["Color", signed(r.color)],
+    ["Clarity", signed(r.clarity)],
+    ["Sharpness", signed(r.sharpness)],
+    ["Noise reduction", signed(r.noiseReduction)],
+    ["Color Chrome", pick(CHROME, r.colorChrome)],
+    ["CC Blue", pick(CHROME, r.ccBlue)],
   ];
   for (const [k, v] of rows) {
     const row = el("div", "row");
@@ -207,9 +348,8 @@ function renderRecipe(r) {
 
 function render(d) {
   app.replaceChildren();
-  const [camera, lens, focal, aperture, shutter, iso, taken, recipe, note, photo] = d;
 
-  const src = photoUrl(photo);
+  const src = photoUrl(d.photo);
   if (src) {
     const img = el("img", "photo");
     img.src = src; img.alt = "Photo"; img.loading = "lazy"; img.referrerPolicy = "no-referrer";
@@ -218,23 +358,22 @@ function render(d) {
   }
 
   const head = el("section", "card");
-  head.append(el("h1", null, has(camera) ? camera : "Unknown camera"));
-  if (has(lens)) head.append(el("div", "sub", lens));
+  head.append(el("h1", null, has(d.camera) ? d.camera : "Unknown camera"));
+  if (has(d.lens)) head.append(el("div", "sub", d.lens));
 
   const exp = el("div", "exposure");
   const cell = (v, l) => { const c = el("div"); c.append(el("b", null, v), el("span", null, l)); return c; };
   exp.append(
-    cell(has(focal) ? focal + " mm" : "—", "Focal"),
-    cell(has(aperture) ? "f/" + aperture : "—", "Aperture"),
-    cell(fmtShutter(shutter), "Shutter"),
-    cell(has(iso) ? String(iso) : "—", "ISO"),
+    cell(has(d.focal) ? d.focal + " mm" : "—", "Focal"),
+    cell(has(d.aperture) ? "f/" + d.aperture : "—", "Aperture"),
+    cell(fmtShutter(d.shutter), "Shutter"),
+    cell(has(d.iso) ? String(d.iso) : "—", "ISO"),
   );
   head.append(exp);
-  if (has(taken)) head.append(el("div", "date", fmtDate(taken)));
-  if (has(note)) head.append(el("div", "note", note));
+  if (has(d.note)) head.append(el("div", "note", d.note));
   app.append(head);
 
-  if (Array.isArray(recipe)) app.append(renderRecipe(recipe));
+  if (d.recipe) app.append(renderRecipe(d.recipe));
 
   const f = el("footer");
   const a = el("a", null, "PhSpectre");
@@ -250,20 +389,25 @@ function renderEmpty(error) {
   if (error) c.append(el("p", "err", "Couldn't read this link: " + error));
   else c.append(el("p", null, "Scan the QR code on a PhSpectre frame to see the shot's details and film recipe here."));
   const b = el("button", null, "Show demo");
-  b.onclick = async () => { location.hash = await encode(DEMO); };
+  b.onclick = () => { location.hash = encode(DEMO); };
   c.append(b);
   app.append(c);
 }
 
-const DEMO = [
-  "FUJIFILM X-T5", "XF 35mm F1.4 R", 35, 2.8, 1 / 250, 400, 202609231717,
-  [3, 3, 0, 2, -5, 2, 3, 3, -2, -1, -4, -2, 1, 2, 1],
-  "Demo shot", null,
-];
+const DEMO = {
+  camera: "X-T5", lens: "XF 35mm F1.4 R",
+  focal: 35, aperture: 1.4, shutter: 1 / 250, iso: 400,
+  recipe: {
+    sim: 3, wb: 3, kelvin: 0, wbShiftR: 2, wbShiftB: -5,
+    dr: 2, highlight: 3, shadow: 3, color: -2, sharpness: -1,
+    noiseReduction: -4, clarity: -2, grain: 1, colorChrome: 2, ccBlue: 1,
+  },
+  note: "Demo shot",
+};
 
-async function boot() {
+function boot() {
   try {
-    const d = await decode(location.hash);
+    const d = decode(location.hash);
     if (d) render(d); else renderEmpty();
   } catch (e) {
     renderEmpty(e.message);

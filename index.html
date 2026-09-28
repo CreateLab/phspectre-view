@@ -38,6 +38,8 @@
     background: var(--accent); color: #1a1200; font-weight: 700; font-size: .95rem;
   }
   .title { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 12px; }
+  .dl { padding: 5px 10px; font-size: .78rem; color: var(--muted); }
+  .dl:hover { color: var(--text); }
   .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 20px; }
   .row { display: flex; justify-content: space-between; gap: 8px; padding: 9px 0; border-bottom: 1px solid var(--line); font-size: .95rem; }
   .row:nth-last-child(-n+2) { border-bottom: 0; }
@@ -315,10 +317,62 @@ function photoUrl(v) {
   return null;
 }
 
-function renderRecipe(r) {
+function slug(s) {
+  return (s || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "phspectre";
+}
+
+function recipeToJson(d) {
+  const r = d.recipe;
+  const out = {};
+  if (has(d.camera)) out.camera = d.camera;
+  if (has(d.lens)) out.lens = d.lens;
+  if (has(d.focal)) out.focalLengthMm = d.focal;
+  if (has(d.aperture)) out.aperture = "f/" + d.aperture;
+  if (has(d.shutter)) out.shutterSpeed = fmtShutter(d.shutter);
+  if (has(d.iso)) out.iso = d.iso;
+  out.filmRecipe = {
+    filmSimulation: pick(SIMS, r.sim),
+    whiteBalance: r.wb === 10 && r.kelvinEnc ? ((r.kelvinEnc - 1) * 10 + 2500) + "K" : pick(WB, r.wb),
+    wbShiftRed: r.wbShiftR,
+    wbShiftBlue: r.wbShiftB,
+    dynamicRange: pick(DR, r.dr),
+    highlightTone: r.highlight / 2,
+    shadowTone: r.shadow / 2,
+    color: r.color,
+    sharpness: r.sharpness,
+    noiseReduction: r.noiseReduction,
+    clarity: r.clarity,
+    grainEffect: pick(GRAIN, r.grain),
+    colorChromeEffect: pick(CHROME, r.colorChrome),
+    colorChromeBlue: pick(CHROME, r.ccBlue),
+  };
+  if (has(d.note)) out.note = d.note;
+  return out;
+}
+
+function downloadRecipeJson(d) {
+  const blob = new Blob([JSON.stringify(recipeToJson(d), null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = el("a");
+  a.href = url;
+  a.download = slug(d.camera) + "-recipe.json";
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function renderRecipe(d) {
+  const r = d.recipe;
   const card = el("section", "card");
   const title = el("div", "title");
-  title.append(el("span", "sim", pick(SIMS, r.sim)), el("span", "label", "Film recipe"));
+  title.append(el("span", "sim", pick(SIMS, r.sim)));
+  const right = el("span");
+  right.append(el("span", "label", "Film recipe "));
+  const dl = el("button", "dl", "Download JSON");
+  dl.onclick = () => downloadRecipeJson(d);
+  right.append(dl);
+  title.append(right);
   card.append(title);
 
   const grid = el("div", "grid");
@@ -357,23 +411,30 @@ function render(d) {
     app.append(img);
   }
 
-  const head = el("section", "card");
-  head.append(el("h1", null, has(d.camera) ? d.camera : "Unknown camera"));
-  if (has(d.lens)) head.append(el("div", "sub", d.lens));
+  const hasExposure = has(d.focal) || has(d.aperture) || has(d.shutter) || has(d.iso);
+  const hasHead = has(d.camera) || has(d.lens) || hasExposure || has(d.note);
 
-  const exp = el("div", "exposure");
-  const cell = (v, l) => { const c = el("div"); c.append(el("b", null, v), el("span", null, l)); return c; };
-  exp.append(
-    cell(has(d.focal) ? d.focal + " mm" : "—", "Focal"),
-    cell(has(d.aperture) ? "f/" + d.aperture : "—", "Aperture"),
-    cell(fmtShutter(d.shutter), "Shutter"),
-    cell(has(d.iso) ? String(d.iso) : "—", "ISO"),
-  );
-  head.append(exp);
-  if (has(d.note)) head.append(el("div", "note", d.note));
-  app.append(head);
+  if (hasHead) {
+    const head = el("section", "card");
+    if (has(d.camera)) head.append(el("h1", null, d.camera));
+    if (has(d.lens)) head.append(el("div", "sub", d.lens));
 
-  if (d.recipe) app.append(renderRecipe(d.recipe));
+    if (hasExposure) {
+      const exp = el("div", "exposure");
+      const cell = (v, l) => { const c = el("div"); c.append(el("b", null, v), el("span", null, l)); return c; };
+      exp.append(
+        cell(has(d.focal) ? d.focal + " mm" : "—", "Focal"),
+        cell(has(d.aperture) ? "f/" + d.aperture : "—", "Aperture"),
+        cell(fmtShutter(d.shutter), "Shutter"),
+        cell(has(d.iso) ? String(d.iso) : "—", "ISO"),
+      );
+      head.append(exp);
+    }
+    if (has(d.note)) head.append(el("div", "note", d.note));
+    app.append(head);
+  }
+
+  if (d.recipe) app.append(renderRecipe(d));
 
   const f = el("footer");
   const a = el("a", null, "PhSpectre");
